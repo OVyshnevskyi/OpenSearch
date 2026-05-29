@@ -64,7 +64,7 @@ import java.util.function.Function;
  * A utility to build XContent (ie json).
  */
 @PublicApi(since = "1.0.0")
-public final class XContentBuilder implements Closeable, Flushable {
+public class XContentBuilder implements Closeable, Flushable {
 
     /**
      * Create a new {@link XContentBuilder} using the given {@link XContent} content.
@@ -1173,4 +1173,31 @@ public final class XContentBuilder implements Closeable, Flushable {
         }
     }
 
+    public static final class LazyXContentBuilder extends XContentBuilder {
+
+        private boolean initialised = false;
+        private final String objectName;
+        private final XContentBuilder delegate;
+
+        public LazyXContentBuilder(String objectName, XContentBuilder delegate) throws IOException {
+            super(delegate.xContent, delegate.bos, delegate.includes, delegate.excludes, delegate, delegate.humanReadable);
+            this.objectName = objectName;
+            this.delegate = delegate;
+        }
+
+        @Override
+        public XContentBuilder field(String name) throws IOException {
+            if (!initialised) {
+                initialised = true;
+                delegate.startObject(objectName);
+            }
+            return delegate.field(name);
+        }
+
+        public void endObjectIfInitialised() throws IOException {
+            if (initialised) {
+                delegate.endObject();
+            }
+        }
+    }
 }

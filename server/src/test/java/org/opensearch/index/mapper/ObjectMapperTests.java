@@ -32,14 +32,22 @@
 
 package org.opensearch.index.mapper;
 
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.store.Directory;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettings;
 import org.opensearch.index.mapper.MapperService.MergeReason;
@@ -52,6 +60,7 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Map;
 
 import org.mockito.Mockito;
 
@@ -601,6 +610,103 @@ public class ObjectMapperTests extends OpenSearchSingleNodeTestCase {
         assertFalse(isParent(documentMapper.objectMappers().get("a.b2.c"), documentMapper.objectMappers().get("a"), mapperService));
         assertFalse(isParent(documentMapper.objectMappers().get("a.b2"), documentMapper.objectMappers().get("a"), mapperService));
         assertFalse(isParent(documentMapper.objectMappers().get("a.b2.c"), documentMapper.objectMappers().get("a.b2"), mapperService));
+    }
+
+    public void testDeriveSource() throws IOException {
+        XContentBuilder mappings = XContentFactory.jsonBuilder()
+            .startObject()
+            .startObject("properties")
+            .startObject("numeric_field")
+            .field("type", "long")
+            .endObject()
+            .startObject("field_1")
+            .startObject("properties")
+            .startObject("field_2")
+            .startObject("properties")
+            .startObject("keyword_field")
+            .field("type", "long")
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject();
+
+        String indexName = "test_derive_1";
+        IndexService index = createIndex(
+            indexName,
+            Settings.builder().put("index.derived_source.enabled", true).build(),
+            mappings
+        );
+
+        MapperService mapperService = index.mapperService();
+
+        // Document WITH the nested object field
+        BytesReference sourceWithField = BytesReference.bytes(
+            XContentFactory.jsonBuilder()
+                .startObject()
+                .field("numeric_field", 42)
+                .startObject("field_1")
+                .startObject("field_2")
+                .field("keyword_field", 100)
+                .endObject()
+                .endObject()
+                .endObject()
+        );
+
+        // Document WITHOUT the nested object field
+        BytesReference sourceWithoutField = BytesReference.bytes(
+            XContentFactory.jsonBuilder()
+                .startObject()
+                .field("numeric_field", 99)
+                .endObject()
+        );
+
+        ParsedDocument docWith = mapperService.documentMapper()
+            .parse(new SourceToParse(indexName, "1", sourceWithField, MediaTypeRegistry.JSON));
+        ParsedDocument docWithout = mapperService.documentMapper()
+            .parse(new SourceToParse(indexName, "2", sourceWithoutField, MediaTypeRegistry.JSON));
+
+        try (Directory directory = newDirectory()) {
+            try (IndexWriter iw = new IndexWriter(directory, new IndexWriterConfig())) {
+                iw.addDocument(docWith.rootDoc());
+                iw.addDocument(docWithout.rootDoc());
+            }
+
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                ObjectMapper objectMapper = mapperService.getObjectMapper("field_1");
+                assertNotNull(objectMapper);
+
+                // Doc 0: has field_1.field_2.keyword_field — should derive the nested object
+                XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
+                objectMapper.deriveSource(builder, reader.leaves().get(0).reader(), 0);
+                builder.endObject();
+
+                Map<String, Object> jsonObject = XContentHelper.convertToMap(
+                    BytesReference.bytes(builder), false, builder.contentType()
+                ).v2();
+                assertTrue(jsonObject.containsKey("field_1"));
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> field1 = (Map<String, Object>) jsonObject.get("field_1");
+                assertTrue(field1.containsKey("field_2"));
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> field2 = (Map<String, Object>) field1.get("field_2");
+                assertEquals(100, field2.get("keyword_field"));
+
+                // Doc 1: does NOT have field_1 — should NOT emit empty objects
+                XContentBuilder builder2 = XContentFactory.jsonBuilder().startObject();
+                objectMapper.deriveSource(builder2, reader.leaves().get(0).reader(), 1);
+                builder2.endObject();
+
+                Map<String, Object> jsonObject2 = XContentHelper.convertToMap(
+                    BytesReference.bytes(builder2), false, builder2.contentType()
+                ).v2();
+                assertFalse("deriveSource should not emit empty object for missing field", jsonObject2.containsKey("field_1"));
+            }
+        }
     }
 
     public void testDeriveSourceMapperValidation() throws IOException {
